@@ -1,6 +1,3 @@
-resistor playground
-
-
-https://playground.google/g/vkdLNf
+digital work jk gate
 
 
