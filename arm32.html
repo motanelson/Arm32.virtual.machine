@@ -1,0 +1,928 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARM32 Interpreter & IDE</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React & Babel -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+    body { font-family: 'Inter', sans-serif; }
+    .font-mono { font-family: 'JetBrains Mono', monospace; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #f8fafc; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  </style>
+</head>
+<body class="bg-slate-100 text-slate-800 antialiased h-screen overflow-hidden">
+  <div id="root" class="h-full flex flex-col"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useMemo } = React;
+
+    // --- SAMPLES & CODE TEMPLATES ---
+    const SAMPLES = {
+      hello: `@ --- Linux ARM32 "Hello World" Syscall ---
+.global _start
+
+.data
+msg:
+    .ascii "Hello, ARM32 Linux World!\\n"
+
+.text
+_start:
+    @ sys_write(stdout=1, buf=msg, count=26)
+    mov r0, #1          @ 1 = stdout
+    ldr r1, =msg        @ load address of msg
+    mov r2, #26         @ string length
+    mov r7, #4          @ syscall #4: sys_write
+    svc 0               @ trigger supervisor call
+
+    @ sys_exit(status=0)
+    mov r0, #0          @ exit status code
+    mov r7, #1          @ syscall #1: sys_exit
+    svc 0`,
+
+      countdown: `@ --- Countdown & Loop Syscall Demo ---
+.global _start
+
+.data
+tick:
+    .ascii "* "
+
+.text
+_start:
+    mov r4, #5          @ count from 5 down to 1
+
+loop:
+    @ sys_write(1, tick, 2)
+    mov r0, #1
+    ldr r1, =tick
+    mov r2, #2
+    mov r7, #4
+    svc 0
+
+    @ Decrement counter and update flags
+    subs r4, r4, #1     @ update Z flag in CPSR
+    bne loop            @ repeat if r4 != 0
+
+exit:
+    mov r0, #42         @ return 42
+    mov r7, #1          @ syscall #1: sys_exit
+    svc 0`,
+
+      fibonacci: `@ --- Fibonacci with Stack Frame (PUSH/POP) ---
+.global _start
+
+.text
+_start:
+    mov r0, #7          @ compute fib(7) = 13
+    bl fib
+    mov r7, #1          @ sys_exit with result in r0
+    svc 0
+
+fib:
+    cmp r0, #1
+    ble fib_base        @ base case: if n <= 1 return n
+
+    push {r4, lr}
+    mov r4, r0          @ preserve n
+    sub r0, r4, #1      @ n - 1
+    bl fib
+
+    push {r0}           @ store fib(n-1)
+    sub r0, r4, #2      @ n - 2
+    bl fib
+    mov r1, r0          @ fib(n-2)
+    pop {r0}            @ fib(n-1)
+
+    add r0, r0, r1      @ fib(n-1) + fib(n-2)
+    pop {r4, lr}
+    bx lr
+
+fib_base:
+    bx lr`
+    };
+
+    // --- VM ARCHITECTURE CONSTANTS ---
+    // 1 MB virtual memory addressing space
+    const MEM_SIZE    = 1024 * 1024; 
+    const TEXT_START  = 0x00010000;
+    const DATA_START  = 0x00020000;
+    const STACK_TOP   = 0x00080000;
+
+    class ARM32VM {
+      constructor() {
+        this.reset();
+      }
+
+      reset() {
+        this.registers = new Int32Array(16); // R0 - R15
+        this.registers[13] = STACK_TOP;      // SP
+        this.registers[14] = 0;              // LR
+        this.registers[15] = TEXT_START;     // PC
+        this.cpsr = { N: 0, Z: 0, C: 0, V: 0 };
+        this.memory = new Uint8Array(MEM_SIZE);
+        this.instructions = [];
+        this.labels = {};
+        this.halted = false;
+        this.exitCode = null;
+        this.stdout = "";
+      }
+
+      // Safe memory operations
+      write8(addr, val) {
+        const uaddr = addr >>> 0;
+        if (uaddr < this.memory.length) {
+          this.memory[uaddr] = val & 0xff;
+        }
+      }
+
+      read8(addr) {
+        const uaddr = addr >>> 0;
+        if (uaddr < this.memory.length) {
+          return this.memory[uaddr];
+        }
+        return 0;
+      }
+
+      write32(addr, val) {
+        const uaddr = addr >>> 0;
+        this.write8(uaddr, val & 0xff);
+        this.write8(uaddr + 1, (val >> 8) & 0xff);
+        this.write8(uaddr + 2, (val >> 16) & 0xff);
+        this.write8(uaddr + 3, (val >> 24) & 0xff);
+      }
+
+      read32(addr) {
+        const uaddr = addr >>> 0;
+        return (
+          this.read8(uaddr) |
+          (this.read8(uaddr + 1) << 8) |
+          (this.read8(uaddr + 2) << 16) |
+          (this.read8(uaddr + 3) << 24)
+        );
+      }
+
+      load(assemblyText) {
+        this.reset();
+        const lines = assemblyText.split("\n");
+        let currentSection = ".text";
+        let dataPtr = DATA_START;
+        let textPtr = TEXT_START;
+        const labels = {};
+        const parsedInst = [];
+
+        // Parsing Pass
+        for (let i = 0; i < lines.length; i++) {
+          let line = lines[i].replace(/(@|\/\/|;).*$/, "").trim();
+          if (!line) continue;
+
+          // Process and extract labels
+          if (line.includes(":")) {
+            const colonIdx = line.indexOf(":");
+            const lbl = line.substring(0, colonIdx).trim();
+            labels[lbl] = currentSection === ".data" ? dataPtr : textPtr;
+            line = line.substring(colonIdx + 1).trim();
+            if (!line) continue;
+          }
+
+          // Directives
+          if (line.startsWith(".")) {
+            if (line.startsWith(".data")) {
+              currentSection = ".data";
+            } else if (line.startsWith(".text")) {
+              currentSection = ".text";
+            } else if (line.startsWith(".ascii") || line.startsWith(".asciz") || line.startsWith(".string")) {
+              const match = line.match(/"([^"]*)"/);
+              if (match) {
+                const str = match[1]
+                  .replace(/\\n/g, "\n")
+                  .replace(/\\t/g, "\t")
+                  .replace(/\\r/g, "\r")
+                  .replace(/\\0/g, "\0");
+                for (let c = 0; c < str.length; c++) {
+                  this.write8(dataPtr++, str.charCodeAt(c));
+                }
+                if (!line.startsWith(".ascii")) {
+                  this.write8(dataPtr++, 0); // null terminator for string/asciz
+                }
+              }
+            } else if (line.startsWith(".word")) {
+              const nums = line.replace(/^\.word\s+/, "").split(",");
+              for (let n of nums) {
+                const val = parseInt(n.trim(), n.trim().startsWith("0x") ? 16 : 10);
+                this.write32(dataPtr, isNaN(val) ? 0 : val);
+                dataPtr += 4;
+              }
+            } else if (line.startsWith(".byte")) {
+              const nums = line.replace(/^\.byte\s+/, "").split(",");
+              for (let n of nums) {
+                const val = parseInt(n.trim(), n.trim().startsWith("0x") ? 16 : 10);
+                this.write8(dataPtr++, isNaN(val) ? 0 : val);
+              }
+            } else if (line.startsWith(".space") || line.startsWith(".skip")) {
+              const sz = parseInt(line.split(/\s+/)[1], 10) || 1;
+              dataPtr += sz;
+            }
+            continue;
+          }
+
+          // Instructions in text section
+          if (currentSection === ".text") {
+            parsedInst.push({ raw: line, addr: textPtr, lineNo: i + 1 });
+            textPtr += 4;
+          }
+        }
+
+        this.instructions = parsedInst;
+        this.labels = labels;
+        this.registers[15] = labels["_start"] !== undefined ? labels["_start"] : TEXT_START;
+      }
+
+      parseReg(str) {
+        if (!str) return -1;
+        str = str.trim().toLowerCase();
+        if (str === "sp") return 13;
+        if (str === "lr") return 14;
+        if (str === "pc") return 15;
+        if (str.startsWith("r")) {
+          const idx = parseInt(str.substring(1), 10);
+          if (idx >= 0 && idx <= 15) return idx;
+        }
+        return -1;
+      }
+
+      parseOperand(op) {
+        if (!op) return 0;
+        op = op.trim();
+        if (op.startsWith("#")) {
+          const numStr = op.substring(1);
+          return parseInt(numStr, numStr.startsWith("0x") ? 16 : 10);
+        }
+        if (op.startsWith("=")) {
+          const target = op.substring(1);
+          if (this.labels[target] !== undefined) return this.labels[target];
+          return parseInt(target, target.startsWith("0x") ? 16 : 10) || 0;
+        }
+        const r = this.parseReg(op);
+        if (r !== -1) return this.registers[r];
+        if (this.labels[op] !== undefined) return this.labels[op];
+        const val = parseInt(op, op.startsWith("0x") ? 16 : 10);
+        return isNaN(val) ? 0 : val;
+      }
+
+      evalCondition(cond) {
+        if (!cond || cond === "al") return true;
+        const { N, Z, C, V } = this.cpsr;
+        switch (cond) {
+          case "eq": return Z === 1;
+          case "ne": return Z === 0;
+          case "cs": case "hs": return C === 1;
+          case "cc": case "lo": return C === 0;
+          case "mi": return N === 1;
+          case "pl": return N === 0;
+          case "vs": return V === 1;
+          case "vc": return V === 0;
+          case "hi": return C === 1 && Z === 0;
+          case "ls": return C === 0 || Z === 1;
+          case "ge": return N === V;
+          case "lt": return N !== V;
+          case "gt": return Z === 0 && N === V;
+          case "le": return Z === 1 || N !== V;
+          default: return true;
+        }
+      }
+
+      updateFlags(result, a, b, isSub = false) {
+        this.cpsr.Z = (result | 0) === 0 ? 1 : 0;
+        this.cpsr.N = (result & 0x80000000) ? 1 : 0;
+        if (isSub) {
+          this.cpsr.C = (a >>> 0) >= (b >>> 0) ? 1 : 0;
+          this.cpsr.V = ((a ^ b) & (a ^ result) & 0x80000000) ? 1 : 0;
+        } else {
+          this.cpsr.C = ((a >>> 0) + (b >>> 0) > 0xffffffff) ? 1 : 0;
+          this.cpsr.V = (~(a ^ b) & (a ^ result) & 0x80000000) ? 1 : 0;
+        }
+      }
+
+      step() {
+        if (this.halted) return false;
+
+        const pc = this.registers[15];
+        const instObj = this.instructions.find(i => i.addr === pc);
+        if (!instObj) {
+          this.halted = true;
+          this.stdout += `\n[Program halted: PC reached end of instructions]\n`;
+          return false;
+        }
+
+        // Advance PC by 4
+        this.registers[15] += 4;
+
+        const line = instObj.raw;
+        const tokens = line.split(/[,\s]+/).filter(Boolean);
+        let mnemonic = tokens[0].toLowerCase();
+
+        // Check conditional branches
+        let cond = "";
+        let setFlags = false;
+
+        const knownConds = ["eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le"];
+        for (let c of knownConds) {
+          if (mnemonic.startsWith("b") && mnemonic === "b" + c) {
+            cond = c;
+            mnemonic = "b";
+            break;
+          }
+        }
+
+        if (mnemonic.endsWith("s") && mnemonic !== "subs" && mnemonic !== "adds" && mnemonic !== "push") {
+          setFlags = true;
+          mnemonic = mnemonic.slice(0, -1);
+        } else if (mnemonic === "subs" || mnemonic === "adds") {
+          setFlags = true;
+          mnemonic = mnemonic.slice(0, -1);
+        }
+
+        if (cond && !this.evalCondition(cond)) {
+          return true; // Condition evaluated false: skip instruction
+        }
+
+        switch (mnemonic) {
+          case "mov": {
+            const rd = this.parseReg(tokens[1]);
+            const val = this.parseOperand(tokens[2]);
+            this.registers[rd] = val;
+            if (setFlags) this.updateFlags(val, 0, 0);
+            break;
+          }
+          case "mvn": {
+            const rd = this.parseReg(tokens[1]);
+            const val = ~this.parseOperand(tokens[2]);
+            this.registers[rd] = val;
+            if (setFlags) this.updateFlags(val, 0, 0);
+            break;
+          }
+          case "add": {
+            const rd = this.parseReg(tokens[1]);
+            const rnVal = this.parseOperand(tokens[2]);
+            const op2Val = tokens[3] ? this.parseOperand(tokens[3]) : rnVal;
+            const res = (rnVal + op2Val) | 0;
+            this.registers[rd] = res;
+            if (setFlags) this.updateFlags(res, rnVal, op2Val, false);
+            break;
+          }
+          case "sub": {
+            const rd = this.parseReg(tokens[1]);
+            const rnVal = this.parseOperand(tokens[2]);
+            const op2Val = tokens[3] ? this.parseOperand(tokens[3]) : this.parseOperand(tokens[2]);
+            const res = (rnVal - op2Val) | 0;
+            this.registers[rd] = res;
+            if (setFlags) this.updateFlags(res, rnVal, op2Val, true);
+            break;
+          }
+          case "cmp": {
+            const rnVal = this.parseOperand(tokens[1]);
+            const op2Val = this.parseOperand(tokens[2]);
+            const res = (rnVal - op2Val) | 0;
+            this.updateFlags(res, rnVal, op2Val, true);
+            break;
+          }
+          case "b": {
+            const target = tokens[1];
+            if (this.labels[target] !== undefined) {
+              this.registers[15] = this.labels[target];
+            }
+            break;
+          }
+          case "bl": {
+            const target = tokens[1];
+            this.registers[14] = this.registers[15]; // LR = next instruction address
+            if (this.labels[target] !== undefined) {
+              this.registers[15] = this.labels[target];
+            }
+            break;
+          }
+          case "bx": {
+            const reg = this.parseReg(tokens[1]);
+            this.registers[15] = this.registers[reg];
+            break;
+          }
+          case "push": {
+            const match = line.match(/\{([^}]+)\}/);
+            if (match) {
+              const regs = match[1].split(",").map(r => this.parseReg(r)).filter(r => r !== -1);
+              // ARM Full-Descending Stack convention
+              regs.sort((a, b) => b - a);
+              for (let r of regs) {
+                this.registers[13] -= 4;
+                this.write32(this.registers[13], this.registers[r]);
+              }
+            }
+            break;
+          }
+          case "pop": {
+            const match = line.match(/\{([^}]+)\}/);
+            if (match) {
+              const regs = match[1].split(",").map(r => this.parseReg(r)).filter(r => r !== -1);
+              regs.sort((a, b) => a - b);
+              for (let r of regs) {
+                this.registers[r] = this.read32(this.registers[13]);
+                this.registers[13] += 4;
+              }
+            }
+            break;
+          }
+          case "ldr":
+          case "ldrb": {
+            const rd = this.parseReg(tokens[1]);
+            if (line.includes("=")) {
+              const op = line.substring(line.indexOf("=")).split(/\s+/)[0];
+              this.registers[rd] = this.parseOperand(op);
+            } else if (line.includes("[")) {
+              const match = line.match(/\[\s*([a-zA-Z0-9]+)(?:\s*,\s*#?(-?\d+))?\s*\]/);
+              if (match) {
+                const rn = this.parseReg(match[1]);
+                const offset = match[2] ? parseInt(match[2], 10) : 0;
+                const addr = (this.registers[rn] + offset) >>> 0;
+                this.registers[rd] = mnemonic === "ldrb" ? this.read8(addr) : this.read32(addr);
+              }
+            }
+            break;
+          }
+          case "str":
+          case "strb": {
+            const rd = this.parseReg(tokens[1]);
+            const match = line.match(/\[\s*([a-zA-Z0-9]+)(?:\s*,\s*#?(-?\d+))?\s*\]/);
+            if (match) {
+              const rn = this.parseReg(match[1]);
+              const offset = match[2] ? parseInt(match[2], 10) : 0;
+              const addr = (this.registers[rn] + offset) >>> 0;
+              if (mnemonic === "strb") {
+                this.write8(addr, this.registers[rd]);
+              } else {
+                this.write32(addr, this.registers[rd]);
+              }
+            }
+            break;
+          }
+          case "svc":
+          case "swi": {
+            this.handleSyscall();
+            break;
+          }
+          default:
+            break;
+        }
+
+        return true;
+      }
+
+      handleSyscall() {
+        const sysNum = this.registers[7]; // R7 holds the syscall number in Linux ARM EABI
+        switch (sysNum) {
+          case 1: { // sys_exit(int status)
+            const status = this.registers[0];
+            this.halted = true;
+            this.exitCode = status;
+            this.stdout += `\n[Program terminated with exit code: ${status}]\n`;
+            break;
+          }
+          case 4: { // sys_write(int fd, const void *buf, size_t count)
+            const fd = this.registers[0];
+            const bufPtr = this.registers[1] >>> 0;
+            const count = this.registers[2];
+
+            let textOut = "";
+            for (let i = 0; i < count; i++) {
+              const ch = this.read8(bufPtr + i);
+              textOut += String.fromCharCode(ch);
+            }
+
+            this.stdout += textOut;
+            this.registers[0] = count; // return count of bytes written
+            break;
+          }
+          default:
+            this.stdout += `\n[Unknown syscall: #${sysNum}]\n`;
+            this.halted = true;
+            break;
+        }
+      }
+    }
+
+    // --- MAIN REACT IDE COMPONENT ---
+    function App() {
+      const [sourceCode, setSourceCode] = useState(SAMPLES.hello);
+      const [vm] = useState(() => new ARM32VM());
+      const [isRunning, setIsRunning] = useState(false);
+      const [speed, setSpeed] = useState(150);
+      const [activeLine, setActiveLine] = useState(null);
+      const [output, setOutput] = useState("");
+      const [registers, setRegisters] = useState([...vm.registers]);
+      const [cpsr, setCpsr] = useState({ ...vm.cpsr });
+      const [halted, setHalted] = useState(false);
+      const [exitCode, setExitCode] = useState(null);
+      const [memViewAddr, setMemViewAddr] = useState("0x00020000");
+      const [activeTab, setActiveTab] = useState("console");
+
+      const timerRef = useRef(null);
+
+      const initVM = (code) => {
+        vm.load(code || sourceCode);
+        syncState();
+      };
+
+      const syncState = () => {
+        setRegisters([...vm.registers]);
+        setCpsr({ ...vm.cpsr });
+        setOutput(vm.stdout);
+        setHalted(vm.halted);
+        setExitCode(vm.exitCode);
+
+        const curPC = vm.registers[15];
+        const inst = vm.instructions.find(i => i.addr === curPC);
+        setActiveLine(inst ? inst.lineNo : null);
+      };
+
+      useEffect(() => {
+        initVM(sourceCode);
+      }, [sourceCode]);
+
+      const handleStep = () => {
+        if (vm.halted) return;
+        vm.step();
+        syncState();
+      };
+
+      const handleRun = () => {
+        if (isRunning) {
+          clearInterval(timerRef.current);
+          setIsRunning(false);
+          return;
+        }
+
+        if (vm.halted) {
+          initVM();
+        }
+
+        setIsRunning(true);
+        timerRef.current = setInterval(() => {
+          if (!vm.halted) {
+            vm.step();
+            syncState();
+          } else {
+            clearInterval(timerRef.current);
+            setIsRunning(false);
+          }
+        }, speed);
+      };
+
+      const handleReset = () => {
+        if (isRunning) {
+          clearInterval(timerRef.current);
+          setIsRunning(false);
+        }
+        initVM();
+      };
+
+      // Memory inspection grid
+      const memDisplayRows = useMemo(() => {
+        let base = parseInt(memViewAddr, 16);
+        if (isNaN(base)) base = 0x00020000;
+        const rows = [];
+        for (let r = 0; r < 8; r++) {
+          const rowAddr = (base + r * 8) >>> 0;
+          const bytes = [];
+          let ascii = "";
+          for (let b = 0; b < 8; b++) {
+            const byte = vm.read8(rowAddr + b);
+            bytes.push(byte.toString(16).padStart(2, "0"));
+            ascii += byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : ".";
+          }
+          rows.push({
+            addr: "0x" + rowAddr.toString(16).padStart(8, "0"),
+            hex: bytes.join(" "),
+            ascii
+          });
+        }
+        return rows;
+      }, [memViewAddr, registers, output]);
+
+      return (
+        <div className="flex flex-col h-full bg-slate-50 text-slate-800">
+          {/* Top Control Bar */}
+          <header className="h-14 bg-white border-b border-slate-200 px-4 flex items-center justify-between shadow-sm z-10">
+            <div className="flex items-center space-x-3">
+              <div className="bg-red-600 text-white font-mono font-bold text-xs px-2 py-1 rounded shadow-sm tracking-wider">
+                ARM<span className="text-red-200 ml-0.5">32</span>
+              </div>
+              <div>
+                <h1 className="font-semibold text-sm text-slate-900 leading-tight">
+                  ARM32 Linux Syscall Emulator
+                </h1>
+                <p className="text-[11px] text-slate-400">AArch32 / EABI Interpreter</p>
+              </div>
+            </div>
+
+            {/* Execution Controls */}
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={handleRun}
+                className={`px-3 py-1.5 rounded text-xs font-semibold shadow-sm transition-all flex items-center space-x-1.5 ${
+                  isRunning
+                    ? "bg-amber-500 hover:bg-amber-600 text-white"
+                    : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                }`}
+              >
+                <span>{isRunning ? "Pause" : "Run"}</span>
+              </button>
+
+              <button
+                onClick={handleStep}
+                disabled={isRunning || vm.halted}
+                className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 disabled:opacity-40 rounded text-xs font-semibold shadow-sm transition-all"
+              >
+                Step Over
+              </button>
+
+              <button
+                onClick={handleReset}
+                className="px-3 py-1.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded text-xs font-semibold shadow-sm transition-all"
+              >
+                Reset
+              </button>
+
+              <div className="h-4 w-px bg-slate-200 mx-2" />
+
+              <div className="flex items-center space-x-1.5 text-xs">
+                <span className="text-slate-500 text-xs">Sample:</span>
+                <select
+                  onChange={(e) => {
+                    handleReset();
+                    setSourceCode(SAMPLES[e.target.value]);
+                  }}
+                  className="bg-white border border-slate-300 rounded px-2 py-1 text-xs font-medium focus:outline-none focus:ring-1 focus:ring-red-500"
+                >
+                  <option value="hello">Hello Syscall (sys_write)</option>
+                  <option value="countdown">Loop & SUBS (tick output)</option>
+                  <option value="fibonacci">Fibonacci & Stack (PUSH/POP)</option>
+                </select>
+              </div>
+            </div>
+          </header>
+
+          {/* IDE Canvas Area */}
+          <div className="flex-1 flex overflow-hidden">
+            {/* Left: Code Document Area */}
+            <div className="flex-1 flex flex-col border-r border-slate-200 bg-white">
+              <div className="h-8 bg-slate-50 border-b border-slate-200 px-4 flex items-center justify-between text-xs font-medium text-slate-500 select-none">
+                <div className="flex items-center space-x-2">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500"></span>
+                  <span className="font-mono text-slate-700 font-semibold">program.s</span>
+                </div>
+                <div className="font-mono text-[11px] text-slate-400">
+                  PC: 0x{registers[15].toString(16).padStart(8, "0")}
+                </div>
+              </div>
+
+              {/* Document Editor */}
+              <div className="flex-1 flex overflow-hidden relative">
+                {/* Line Gutter with Active Instruction Pointer */}
+                <div className="w-12 py-3 bg-slate-50 border-r border-slate-200 select-none text-right pr-2 text-xs font-mono text-slate-400 leading-6">
+                  {sourceCode.split("\n").map((_, i) => {
+                    const lineNo = i + 1;
+                    const isCurrent = activeLine === lineNo;
+                    return (
+                      <div
+                        key={i}
+                        className={`flex items-center justify-end h-6 relative ${
+                          isCurrent ? "font-bold text-amber-600" : ""
+                        }`}
+                      >
+                        {isCurrent && (
+                          <span className="absolute left-1.5 text-amber-500 text-[11px]">
+                            ▶
+                          </span>
+                        )}
+                        <span>{lineNo}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <textarea
+                  value={sourceCode}
+                  onChange={(e) => setSourceCode(e.target.value)}
+                  spellCheck="false"
+                  className="flex-1 p-3 font-mono text-xs leading-6 resize-none focus:outline-none text-slate-800 bg-white selection:bg-red-100"
+                />
+              </div>
+
+              {/* Status Footer */}
+              <div className="h-7 bg-slate-50 border-t border-slate-200 px-4 flex items-center justify-between text-xs text-slate-500">
+                <div className="flex items-center space-x-2">
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      halted ? "bg-rose-500" : isRunning ? "bg-emerald-500 animate-pulse" : "bg-amber-400"
+                    }`}
+                  />
+                  <span className="font-medium text-slate-700">
+                    {halted
+                      ? `Halted (Exit Code: ${exitCode !== null ? exitCode : "0"})`
+                      : isRunning
+                      ? "Executing"
+                      : "Ready"}
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-400">
+                  Memory Map: Text @ 0x10000 | Data @ 0x20000 | Stack @ 0x80000
+                </div>
+              </div>
+            </div>
+
+            {/* Right: Registers, Terminal & Inspection Panes */}
+            <div className="w-96 flex flex-col bg-slate-50">
+              {/* Registers Panel */}
+              <div className="p-3 bg-white border-b border-slate-200">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                    Registers
+                  </span>
+                  {/* CPSR Flags */}
+                  <div className="flex items-center space-x-1 text-[10px] font-mono font-bold">
+                    <span className="text-slate-400 mr-1 text-[9px]">CPSR:</span>
+                    <span className={`px-1.5 py-0.5 rounded border ${cpsr.N ? 'bg-red-50 text-red-700 border-red-300' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>N:{cpsr.N}</span>
+                    <span className={`px-1.5 py-0.5 rounded border ${cpsr.Z ? 'bg-blue-50 text-blue-700 border-blue-300' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>Z:{cpsr.Z}</span>
+                    <span className={`px-1.5 py-0.5 rounded border ${cpsr.C ? 'bg-green-50 text-green-700 border-green-300' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>C:{cpsr.C}</span>
+                    <span className={`px-1.5 py-0.5 rounded border ${cpsr.V ? 'bg-amber-50 text-amber-700 border-amber-300' : 'bg-slate-50 text-slate-400 border-slate-200'}`}>V:{cpsr.V}</span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-1.5 font-mono text-xs">
+                  {registers.map((val, idx) => {
+                    let label = `r${idx}`;
+                    let isSpecial = false;
+                    if (idx === 7)  { label = "r7 (sys)"; isSpecial = true; }
+                    if (idx === 13) { label = "sp (r13)"; isSpecial = true; }
+                    if (idx === 14) { label = "lr (r14)"; isSpecial = true; }
+                    if (idx === 15) { label = "pc (r15)"; isSpecial = true; }
+
+                    const hexVal = "0x" + (val >>> 0).toString(16).padStart(8, "0");
+                    return (
+                      <div
+                        key={idx}
+                        className={`flex justify-between items-center px-2 py-1 rounded border text-[11px] ${
+                          isSpecial
+                            ? "bg-red-50/50 border-red-200 font-medium"
+                            : "bg-white border-slate-200"
+                        }`}
+                      >
+                        <span className={isSpecial ? "text-red-700 font-semibold" : "text-slate-400"}>
+                          {label}
+                        </span>
+                        <span className="text-slate-800 font-mono text-[11px]" title={`Decimal: ${val}`}>
+                          {hexVal}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Bottom Multi-Panel Tabs */}
+              <div className="flex-1 flex flex-col min-h-0 bg-white">
+                <div className="flex border-b border-slate-200 bg-slate-50 text-xs">
+                  <button
+                    onClick={() => setActiveTab("console")}
+                    className={`px-4 py-2 border-r border-slate-200 font-medium ${
+                      activeTab === "console"
+                        ? "bg-white text-red-600 border-b-2 border-b-red-600 font-semibold"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    Console Output
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("memory")}
+                    className={`px-4 py-2 border-r border-slate-200 font-medium ${
+                      activeTab === "memory"
+                        ? "bg-white text-red-600 border-b-2 border-b-red-600 font-semibold"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    Memory View
+                  </button>
+                  <button
+                    onClick={() => setActiveTab("docs")}
+                    className={`px-4 py-2 font-medium ${
+                      activeTab === "docs"
+                        ? "bg-white text-red-600 border-b-2 border-b-red-600 font-semibold"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    Syscalls Ref
+                  </button>
+                </div>
+
+                <div className="flex-1 p-3 overflow-auto">
+                  {/* Console Tab */}
+                  {activeTab === "console" && (
+                    <div className="h-full flex flex-col">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
+                          Linux stdout
+                        </span>
+                        <button
+                          onClick={() => setOutput("")}
+                          className="text-[10px] text-slate-400 hover:text-slate-600 font-medium"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                      <div className="flex-1 bg-slate-900 text-emerald-400 font-mono text-xs p-3 rounded overflow-auto whitespace-pre-wrap shadow-inner">
+                        {output || "// Output from sys_write will appear here..."}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Memory View Tab */}
+                  {activeTab === "memory" && (
+                    <div className="h-full flex flex-col">
+                      <div className="flex items-center space-x-2 mb-2">
+                        <span className="text-xs text-slate-500 font-medium">Jump Address:</span>
+                        <input
+                          type="text"
+                          value={memViewAddr}
+                          onChange={(e) => setMemViewAddr(e.target.value)}
+                          className="font-mono text-xs px-2 py-0.5 border border-slate-300 rounded w-28 focus:outline-none focus:ring-1 focus:ring-red-500"
+                        />
+                      </div>
+                      <div className="flex-1 font-mono text-[11px] bg-slate-50 p-2 border border-slate-200 rounded overflow-auto">
+                        <div className="text-slate-400 pb-1 border-b border-slate-200 mb-1 flex justify-between">
+                          <span>Address</span>
+                          <span>Hex Bytes</span>
+                          <span>ASCII</span>
+                        </div>
+                        {memDisplayRows.map((row, idx) => (
+                          <div key={idx} className="flex justify-between py-0.5 border-b border-slate-100 last:border-none">
+                            <span className="text-red-700 font-semibold">{row.addr}</span>
+                            <span className="text-slate-700">{row.hex}</span>
+                            <span className="text-slate-400 tracking-wider">[{row.ascii}]</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Documentation Tab */}
+                  {activeTab === "docs" && (
+                    <div className="text-xs space-y-3 text-slate-700 leading-relaxed overflow-y-auto">
+                      <div>
+                        <h3 className="font-bold text-slate-900 border-b border-slate-200 pb-1">
+                          Linux ARM EABI Calling Convention
+                        </h3>
+                        <p className="mt-1 text-slate-600">
+                          Syscalls are invoked via <code>svc 0</code> (Supervisor Call).
+                          The syscall number is loaded into <strong>R7</strong>.
+                        </p>
+                      </div>
+
+                      <div className="space-y-2">
+                        <div className="p-2 bg-slate-50 border border-slate-200 rounded">
+                          <span className="font-bold font-mono text-red-700">sys_write (R7 = 4)</span>
+                          <p className="text-[11px] text-slate-600 mt-0.5">
+                            <code>R0</code>: File descriptor (1 = stdout)<br />
+                            <code>R1</code>: Pointer to buffer (e.g. <code>=msg</code>)<br />
+                            <code>R2</code>: Count (bytes to write)
+                          </p>
+                        </div>
+
+                        <div className="p-2 bg-slate-50 border border-slate-200 rounded">
+                          <span className="font-bold font-mono text-red-700">sys_exit (R7 = 1)</span>
+                          <p className="text-[11px] text-slate-600 mt-0.5">
+                            <code>R0</code>: Exit status code (e.g. 0)
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
